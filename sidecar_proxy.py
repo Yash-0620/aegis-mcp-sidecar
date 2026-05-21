@@ -3,7 +3,6 @@ import httpx
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import StreamingResponse
 from starlette.background import BackgroundTask
-from aegis_aip import AegisClient
 
 app = FastAPI(title="Aegis Zero-Trust MCP Sidecar")
 
@@ -15,15 +14,9 @@ AGENT_ID = os.getenv("AEGIS_AGENT_ID")
 if not AGENT_ID:
     raise RuntimeError("[AEGIS ERROR] AEGIS_AGENT_ID environment variable is missing.")
 
-# --- BOOT SEQUENCE ---
-print(f"--- INITIALIZING AEGIS SIDECAR ---", flush=True)
-try:
-    aegis = AegisClient(agent_id=AGENT_ID, control_plane_url=AEGIS_CONTROL_PLANE)
-    print("--- AEGIS AUTHENTICATION SUCCESSFUL ---", flush=True)
-except Exception as e:
-    raise RuntimeError(f"[AEGIS FATAL] Failed to authenticate sidecar: {e}")
+print(f"--- INITIALIZING AEGIS SIDECAR FOR {AGENT_ID[:10]}... ---", flush=True)
 
-# --- ASYNC SIEM TELEMETRY (Routed securely via Aegis Cloud) ---
+# --- ASYNC SIEM TELEMETRY ---
 async def log_threat_to_siem(threat_reason: str, tool_name: str = "unknown"):
     payload = {
         "agent_id": AGENT_ID,
@@ -42,25 +35,42 @@ async def log_threat_to_siem(threat_reason: str, tool_name: str = "unknown"):
 async def mcp_reverse_proxy(request: Request, path: str):
     aegis_token = request.headers.get("X-Aegis-IBCT")
     
+    # 1. Unauthenticated Network Edge Check
     if not aegis_token and request.method == "POST":
         reason = "Missing X-Aegis-IBCT authorization token."
         await log_threat_to_siem(reason, "unauthorized_access")
         raise HTTPException(status_code=401, detail=f"[AEGIS BLOCKED] {reason}")
 
+    # 2. Authenticated Protocol Evaluation
     if request.method == "POST":
         try:
             body = await request.json()
             if "method" in body and body["method"] == "tools/call":
                 tool_name = body.get("params", {}).get("name")
                 tool_args = body.get("params", {}).get("arguments", {})
-                try:
-                    aegis.secure_tool_call(tool_name=tool_name, params=tool_args)
-                except Exception as e:
-                    reason = str(e)
-                    await log_threat_to_siem(reason, tool_name)
-                    raise HTTPException(status_code=403, detail=f"[AEGIS BLOCKED] {reason}")
-        except ValueError: pass 
+                
+                # Ask Render Control Plane to evaluate the math bounds using the provided token
+                eval_payload = {
+                    "token": aegis_token,
+                    "tool_name": tool_name,
+                    "params": tool_args
+                }
+                
+                async with httpx.AsyncClient() as eval_client:
+                    eval_res = await eval_client.post(f"{AEGIS_CONTROL_PLANE}/execute", json=eval_payload)
+                    eval_data = eval_res.json()
+                    
+                    # THE FIX: Explicitly check if the Bouncer blocked it
+                    if eval_data.get("status") in ["BLOCKED", "ACCESS_DENIED"]:
+                        reason = eval_data.get("reason", "Unknown Policy Violation")
+                        # The Control Plane already logs it to Supabase during `/execute`, 
+                        # so we just drop the connection here.
+                        raise HTTPException(status_code=403, detail=reason)
+                        
+        except ValueError: 
+            pass # Not JSON, let the target MCP server handle it
 
+    # 3. Forward Clean Traffic
     client = httpx.AsyncClient(base_url=TARGET_MCP_URL)
     req = client.build_request(request.method, request.url.path, headers=request.headers.raw, content=await request.body())
     response = await client.send(req, stream=True)
