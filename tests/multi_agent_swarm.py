@@ -1,12 +1,10 @@
 import requests
-import json
 import threading
-import time
 
 # --- CONFIGURATION ---
 # PASTE YOUR TWO DISTINCT AGENT IDs HERE
-AGENT_FINANCE_ID = "FinanceTest2_live_093225d1cc4f3ab4a86e22b3d140c76c" 
-AGENT_DATA_ID = "DataTest_live_f83935cb6c3c3884f22fcebfa364c142"
+AGENT_FINANCE_ID = "FinanceTest_live_17a1ee60336fde01d82750761d16e04f" # Note: This is a TEST ID. REPLACE WITH YOUR ACTUAL AGENT ID in production.
+AGENT_DATA_ID = "AgentTest_live_67beb9582c326a4edccce1b9612df452"  # Note: This is a TEST ID. REPLACE WITH YOUR ACTUAL AGENT ID in production.
 
 CONTROL_PLANE_URL = "https://aegis-live-node.onrender.com"
 SIDECAR_URL = "http://localhost:8080/mcp"
@@ -53,8 +51,9 @@ def fire_isolated_strike(strike_data):
 
     try:
         res = requests.post(SIDECAR_URL, headers=headers, json=payload, timeout=5)
-        if res.status_code == 501:
-            outcome = "🟢 ALLOWED"
+        # FIX: Updated to align with the new Ed25519 Edge Proxy response codes
+        if res.status_code == 200:
+            outcome = "🟢 ALLOWED (Target Reached)"
         elif res.status_code in [401, 403]:
             outcome = f"🔴 BLOCKED ({res.json().get('detail', 'Unknown Error')})"
         else:
@@ -62,7 +61,7 @@ def fire_isolated_strike(strike_data):
     except Exception as e:
         outcome = f"❌ CRASH ({str(e)})"
         
-    results.append(f"[{strike_data['agent']}] {strike_data['desc'].ljust(50)} | {outcome}")
+    results.append(f"[{strike_data['agent'].ljust(12)}] {strike_data['desc'].ljust(48)} | {outcome}")
 
 print("--- UNLEASHING CONCURRENT MULTI-AGENT SWARM ---")
 threads = []
