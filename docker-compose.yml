@@ -14,7 +14,7 @@ services:
     environment:
       - TARGET_MCP_URL=http://target-mcp:8000
       - AEGIS_CONTROL_PLANE_URL=https://aegis-live-node.onrender.com
-      - AEGIS_AGENT_ID=your_aegis_agent_id_here
+      - AEGIS_AGENT_ID=Test1_live_68b171e65a4123bc006a9a252c1bd856 # <--- UPDATE THIS WITH YOUR ACTUAL AGENT ID
       - PYTHONUNBUFFERED=1
     networks:
       - aegis_secure_net
