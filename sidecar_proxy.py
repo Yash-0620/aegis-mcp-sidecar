@@ -5,6 +5,7 @@ from fastapi import FastAPI, Request, Response, HTTPException, status
 from fastapi.responses import JSONResponse
 import httpx
 from jsonschema import validate, ValidationError
+import asyncio
 
 app = FastAPI(title="Aegis Zero-Trust Universal Sidecar")
 
@@ -17,7 +18,9 @@ MCowBQYDK2VwAyEAjW1Lg7SRz2/K8ASyRhk9svTaJj7rtpTudllj7vCUIHU=
 
 # The internal network address where the actual, unprotected MCP server is listening.
 # This port is isolated and invisible to the outside network.
-TARGET_MCP_SERVER_URL = os.getenv("TARGET_MCP_URL", "http://target-mcp:8000")
+# --- CONFIGURATION ---
+TARGET_MCP_URL = os.environ.get("TARGET_MCP_URL", "http://localhost:8000")
+TELEMETRY_URL = "https://aegis-live-node.onrender.com/telemetry/log_threat"
 
 # --- 2. The Cryptographic Bouncer Core ---
 def verify_and_decode_token(token: str) -> dict:
@@ -32,6 +35,22 @@ def verify_and_decode_token(token: str) -> dict:
         raise HTTPException(status_code=401, detail="Token signature has expired")
     except jwt.InvalidTokenError:
         raise HTTPException(status_code=403, detail="Cryptographic signature verification failed")
+    
+
+async def push_telemetry(agent_id: str, action: str, target: str, reason: str, status: str):
+    """Fires telemetry back to the control plane asynchronously."""
+    async with httpx.AsyncClient() as client:
+        try:
+            payload = {
+                "agent_id": agent_id,
+                "action": action,
+                "target": target,
+                "reason": reason,
+                "status": status
+            }
+            await client.post(f"{CONTROL_PLANE_URL}/telemetry", json=payload, timeout=2.0)
+        except Exception as e:
+            print(f"Failed to push telemetry: {e}")
 
 # --- 3. The Universal Validation Interceptor ---
 @app.post("/mcp/v1/tools/call")
@@ -51,6 +70,7 @@ async def intercept_tool_call(request: Request):
     # 2. Extract and cryptographically verify claims locally
     try:
         claims = verify_and_decode_token(token)
+        agent_id = claims.get("agent_id", "Unknown-Agent")
     except HTTPException as e:
         return JSONResponse(status_code=e.status_code, content={"error": "Security violation", "message": e.detail})
 
@@ -101,6 +121,10 @@ async def intercept_tool_call(request: Request):
         # Validates fields, data types, string minimum/maximum lengths, regex patterns, enum lists, and values.
         validate(instance=tool_arguments, schema=tool_schema)
     except ValidationError as e:
+        # FIRE TELEMETRY: BLOCKED
+        target_str = json.dumps(tool_arguments)[:100] # Safe capture of the attempted payload
+        asyncio.create_task(push_telemetry(agent_id, tool_name, target_str, f"Schema breach: {e.message}", "BLOCKED"))
+        
         # Bounded containment hit: The LLM attempted an action that violates the structural safety envelope.
         return JSONResponse(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
