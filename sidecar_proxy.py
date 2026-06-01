@@ -61,10 +61,17 @@ async def intercept_tool_call(request: Request):
     """
     # 1. Extract the Invocation-Bound Capability Token (IBCT)
     token = request.headers.get("X-Aegis-IBCT")
+    # THE ENTERPRISE PATCH: Fallback to standard Bearer Auth for proprietary agents 
+    # (Microsoft 365 Copilot, Amazon Q, OpenAI Custom GPTs)
+    if not token:
+        auth_header = request.headers.get("Authorization")
+        if auth_header and auth_header.startswith("Bearer "):
+            token = auth_header.split(" ")[1]
+
     if not token:
         return JSONResponse(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            content={"error": "Missing Security Context", "message": "X-Aegis-IBCT header required"}
+            content={"error": "Missing Security Context", "message": "X-Aegis-IBCT or Bearer Token required"}
         )
 
     # 2. Extract and cryptographically verify claims locally
