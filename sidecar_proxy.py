@@ -37,20 +37,19 @@ def verify_and_decode_token(token: str) -> dict:
         raise HTTPException(status_code=403, detail="Cryptographic signature verification failed")
     
 
-async def push_telemetry(agent_id: str, action: str, target: str, reason: str, status: str):
-    """Fires telemetry back to the control plane asynchronously."""
+async def log_telemetry(jwt_payload: dict, action: str, target: str, reason: str, status: str = "BLOCKED"):
+    """Fire-and-forget telemetry for both Blocks and Allows."""
     async with httpx.AsyncClient() as client:
         try:
-            payload = {
-                "agent_id": agent_id,
+            await client.post(TELEMETRY_URL, json={
+                "agent_id": jwt_payload.get("agent_id", "Unknown"), # Grabbing agent_id from the decoded token
                 "action": action,
-                "target": target,
+                "target": target,  
                 "reason": reason,
                 "status": status
-            }
-            await client.post(f"{CONTROL_PLANE_URL}/telemetry", json=payload, timeout=2.0)
+            }, timeout=2.0)
         except Exception as e:
-            print(f"Failed to push telemetry: {e}")
+            print(f"[Telemetry Warning] Could not sync telemetry: {e}")
 
 # --- 3. The Universal Validation Interceptor ---
 @app.post("/mcp/v1/tools/call")
@@ -122,8 +121,8 @@ async def intercept_tool_call(request: Request):
         validate(instance=tool_arguments, schema=tool_schema)
     except ValidationError as e:
         # FIRE TELEMETRY: BLOCKED
-        target_str = json.dumps(tool_arguments)[:100] # Safe capture of the attempted payload
-        asyncio.create_task(push_telemetry(agent_id, tool_name, target_str, f"Schema breach: {e.message}", "BLOCKED"))
+        target_str = json.dumps(tool_arguments)[:200] # Safe capture of the attempted payload
+        asyncio.create_task(log_telemetry(claims, tool_name, target_str, f"Schema breach: {e.message}", "BLOCKED"))
         
         # Bounded containment hit: The LLM attempted an action that violates the structural safety envelope.
         return JSONResponse(
@@ -134,6 +133,10 @@ async def intercept_tool_call(request: Request):
                 "validation_error": e.message
             }
         )
+    
+        # FIRE TELEMETRY: ALLOWED
+    target_str = json.dumps(tool_arguments)[:200]
+    asyncio.create_task(log_telemetry(claims, tool_name, target_str, "Mathematical bounds verified", "ALLOWED"))
 
     # --- 6. Secure Routing ---
     # The payload is safe, authenticated, and structurally verified. Forward it to the target MCP Server.
