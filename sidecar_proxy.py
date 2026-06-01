@@ -1,111 +1,129 @@
-import httpx
-import jwt
+import json
 import os
-from fastapi import FastAPI, Request, HTTPException
+import jwt
+from fastapi import FastAPI, Request, Response, HTTPException, status
 from fastapi.responses import JSONResponse
-import asyncio
+import httpx
+from jsonschema import validate, ValidationError
 
-app = FastAPI()
+app = FastAPI(title="Aegis Zero-Trust Universal Sidecar")
 
-# --- CONFIGURATION ---
-TARGET_MCP_URL = os.environ.get("TARGET_MCP_URL", "http://localhost:8000")
-TELEMETRY_URL = "https://aegis-live-node.onrender.com/telemetry/log_threat"
-
-# The Open-Source Verifier (PASTE YOUR GENERATED PUBLIC KEY HERE)
-PUBLIC_KEY = """-----BEGIN PUBLIC KEY-----
+# --- 1. Embedded Trust Root ---
+# As planned, the public key is hardcoded directly at the edge repository.
+# Any token not signed by our control plane's matching private key fails instantly.
+AEGIS_PUBLIC_KEY = """-----BEGIN PUBLIC KEY-----
 MCowBQYDK2VwAyEAjW1Lg7SRz2/K8ASyRhk9svTaJj7rtpTudllj7vCUIHU=
 -----END PUBLIC KEY-----"""
 
-async def log_telemetry(jwt_payload: dict, action: str, target: str, reason: str, status: str = "BLOCKED"):
-    """Fire-and-forget telemetry for both Blocks and Allows."""
-    async with httpx.AsyncClient() as client:
-        try:
-            await client.post(TELEMETRY_URL, json={
-                "agent_id": jwt_payload.get("api_key"),
-                "action": action,
-                "target": target,  # <-- Sending the arguments back to your UI
-                "reason": reason,
-                "status": status
-            })
-        except Exception as e:
-            print(f"[Telemetry Warning] Could not sync telemetry: {e}")
+# The internal network address where the actual, unprotected MCP server is listening.
+# This port is isolated and invisible to the outside network.
+TARGET_MCP_SERVER_URL = os.getenv("TARGET_MCP_URL", "http://target-mcp:8000")
 
-@app.post("/{path:path}")
-async def proxy_mcp_request(path: str, request: Request):
-    """The Stateless Cryptographic Interceptor"""
+# --- 2. The Cryptographic Bouncer Core ---
+def verify_and_decode_token(token: str) -> dict:
+    """
+    Mathematically verifies the token signature at the edge using Ed25519.
+    Zero network latency—no calls back to the control plane.
+    """
+    try:
+        payload = jwt.decode(token, AEGIS_PUBLIC_KEY, algorithms=["EdDSA"])
+        return payload
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Token signature has expired")
+    except jwt.InvalidTokenError:
+        raise HTTPException(status_code=403, detail="Cryptographic signature verification failed")
+
+# --- 3. The Universal Validation Interceptor ---
+@app.post("/mcp/v1/tools/call")
+async def intercept_tool_call(request: Request):
+    """
+    Universal network-layer interceptor. Handles ANY tool call format
+    by analyzing the mathematical shape of the JSON parameters.
+    """
+    # 1. Extract the Invocation-Bound Capability Token (IBCT)
     token = request.headers.get("X-Aegis-IBCT")
-    
     if not token:
-        return JSONResponse(status_code=401, content={"detail": "Access Denied: Missing X-Aegis-IBCT header"})
+        return JSONResponse(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            content={"error": "Missing Security Context", "message": "X-Aegis-IBCT header required"}
+        )
+
+    # 2. Extract and cryptographically verify claims locally
+    try:
+        claims = verify_and_decode_token(token)
+    except HTTPException as e:
+        return JSONResponse(status_code=e.status_code, content={"error": "Security violation", "message": e.detail})
+
+    allowed_scopes = claims.get("allowed_scopes", [])
+    schema_bounds = claims.get("schema_bounds", {})
+
+    # 3. Parse the incoming JSON payload from the AI Agent
+    try:
+        body = await request.json()
+    except json.JSONDecodeError:
+        return JSONResponse(status_code=400, content={"error": "Invalid payload", "message": "Malformed JSON request"})
+
+    # Extract target tool details using standard MCP JSON-RPC mapping
+    # Example format: { "method": "tools/call", "params": { "name": "github:repo:delete", "arguments": {...} } }
+    params = body.get("params", {})
+    tool_name = params.get("name")
+    tool_arguments = params.get("arguments", {})
+
+    if not tool_name:
+        return JSONResponse(status_code=400, content={"error": "Invalid protocol", "message": "Missing target tool name"})
+
+    # 4. Scope Guard: Is the AI Agent even permitted to talk to this tool?
+    if tool_name not in allowed_scopes:
+        return JSONResponse(
+            status_code=status.HTTP_403_FORBIDDEN,
+            content={
+                "error": "Scope Violation", 
+                "message": f"Agent identity lacks authorization scope for tool: '{tool_name}'"
+            }
+        )
+
+    # 5. Schema Guard: Does the payload match the mathematical constraints?
+    # Retrieve the specific JSON-Schema that the CISO applied to this scope
+    tool_schema = schema_bounds.get(tool_name)
+    
+    if not tool_schema:
+        # Fail-Closed Rule: If a scope is granted but no validation schema is present, deny execution.
+        return JSONResponse(
+            status_code=status.HTTP_403_FORBIDDEN,
+            content={
+                "error": "Policy Misconfiguration", 
+                "message": f"No JSON-Schema bounds defined for authorized scope: '{tool_name}'. Failing closed."
+            }
+        )
 
     try:
-        # MATHEMATICAL VERIFICATION 
-        payload = jwt.decode(token, PUBLIC_KEY, algorithms=["EdDSA"])
-    except jwt.ExpiredSignatureError:
-        return JSONResponse(status_code=403, content={"detail": "Token Expired. Rotate identity."})
-    except jwt.InvalidTokenError as e:
-        return JSONResponse(status_code=403, content={"detail": f"Cryptographic Verification Failed: {str(e)}"})
+        # PURE MATHEMATICAL VALIDATION
+        # Validates fields, data types, string minimum/maximum lengths, regex patterns, enum lists, and values.
+        validate(instance=tool_arguments, schema=tool_schema)
+    except ValidationError as e:
+        # Bounded containment hit: The LLM attempted an action that violates the structural safety envelope.
+        return JSONResponse(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            content={
+                "error": "Aegis Bounded Containment Breach",
+                "message": "The AI tool payload structurally violated the CISO security schema.",
+                "validation_error": e.message
+            }
+        )
 
-    # LOCAL INTENT BOUNDS CHECKING
-    body = await request.json()
-    if body.get("method") == "tools/call":
-        tool_name = body["params"]["name"]
-        tool_args = body["params"].get("arguments", {})
-        
-        # Convert the arguments payload into a string for your Forensics UI
-        target_str = str(tool_args)
-
-        scopes = payload.get("scopes", [])
-        constraints = payload.get("constraints", {})
-
-        if tool_name not in scopes:
-            reason = f"Restricted Scope Violation: {tool_name}"
-            asyncio.create_task(log_telemetry(payload, tool_name, target_str, reason, "BLOCKED"))
-            return JSONResponse(status_code=403, content={"detail": reason})
-
-        if tool_name in constraints:
-            rules = constraints[tool_name]
-            
-            if tool_name == "stripe:refund:write" and "max_amount" in rules:
-                if int(tool_args.get("amount", 0)) > int(rules["max_amount"]):
-                    reason = f"Mathematical Bound Exceeded (${rules['max_amount']} limit)"
-                    asyncio.create_task(log_telemetry(payload, tool_name, target_str, reason, "BLOCKED"))
-                    return JSONResponse(status_code=403, content={"detail": reason})
-            
-            if tool_name == "fs:search:read" and "allowed_extensions" in rules:
-                ext = f".{tool_args.get('file_extension', '')}"
-                if ext not in rules["allowed_extensions"]:
-                    reason = f"Unauthorized File Extension: {ext.replace('.', '')}"
-                    asyncio.create_task(log_telemetry(payload, tool_name, target_str, reason, "BLOCKED"))
-                    return JSONResponse(status_code=403, content={"detail": reason})
-
-            if tool_name == "database:query:read" and "target_table" in rules:
-                query_str = str(tool_args).lower()
-                target = rules["target_table"].lower()
-                if "users" in query_str and target != "users":
-                    reason = "Unauthorized Table Access: users"
-                    asyncio.create_task(log_telemetry(payload, tool_name, target_str, reason, "BLOCKED"))
-                    return JSONResponse(status_code=403, content={"detail": reason})
-            
-            if tool_name == "email:send:write" and "allowed_domains" in rules:
-                recipient = str(tool_args)
-                if "test.com" in recipient and "test.com" not in rules["allowed_domains"]:
-                    reason = "Exfiltration Attempt - Domain test.com not in whitelist"
-                    asyncio.create_task(log_telemetry(payload, tool_name, target_str, reason, "BLOCKED"))
-                    return JSONResponse(status_code=403, content={"detail": reason})
-
-        # LOG THE ALLOWED ACTION
-        asyncio.create_task(log_telemetry(payload, tool_name, target_str, "Policy matched", "ALLOWED"))
-
-    # FORWARD CLEAN TRAFFIC TO LOCAL MCP
+    # --- 6. Secure Routing ---
+    # The payload is safe, authenticated, and structurally verified. Forward it to the target MCP Server.
     async with httpx.AsyncClient() as client:
         try:
-            resp = await client.post(f"{TARGET_MCP_URL}/{path}", json=body)
-            try:
-                content = resp.json()
-            except ValueError:
-                content = {"status": "SUCCESS", "raw_response": "Target MCP Reached (Dummy Server Response)"}
-            status = 200 if resp.status_code == 501 else resp.status_code
-            return JSONResponse(status_code=status, content=content)
-        except Exception as e:
-            return JSONResponse(status_code=502, content={"detail": f"Failed to reach local MCP: {str(e)}"})
+            response = await client.post(
+                f"{TARGET_MCP_SERVER_URL}/mcp/v1/tools/call",
+                json=body,
+                headers={"Content-Type": "application/json"},
+                timeout=5.0 # Keep latency overhead tight
+            )
+            return Response(content=response.content, status_code=response.status_code, headers=dict(response.headers))
+        except httpx.RequestError as e:
+            return JSONResponse(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                content={"error": "Infrastructure Error", "message": f"Could not route payload to target MCP server: {str(e)}"}
+            )
