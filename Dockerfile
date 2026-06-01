@@ -3,7 +3,7 @@ FROM python:3.11-slim
 WORKDIR /app
 
 # 1. Install all dependencies, explicitly including cryptography
-RUN pip install fastapi uvicorn httpx aegis-aip PyJWT==2.10.1 cryptography
+RUN pip install fastapi uvicorn httpx aegis-aip PyJWT==2.10.1 cryptography jsonschema
 
 # 2. Copy the proxy logic
 COPY sidecar_proxy.py .
