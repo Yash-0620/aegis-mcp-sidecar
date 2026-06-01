@@ -42,7 +42,8 @@ async def log_telemetry(jwt_payload: dict, action: str, target: str, reason: str
     async with httpx.AsyncClient() as client:
         try:
             await client.post(TELEMETRY_URL, json={
-                "agent_id": jwt_payload.get("agent_id", "Unknown"), # Grabbing agent_id from the decoded token
+                "user_id": jwt_payload.get("user_id"), # <-- THE FIX: Pass the CISO's Identity
+                "agent_id": jwt_payload.get("agent_id", "Unknown"), 
                 "action": action,
                 "target": target,  
                 "reason": reason,
