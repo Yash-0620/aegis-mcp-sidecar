@@ -22,7 +22,7 @@ DevOps teams can deploy Aegis via a frictionless drop-in solution to any existin
 ### 1. Define Policies & Get Your API Key
 Before deploying the sidecar, head to the **[Aegis Cloud Console](https://aegis-cloud-console.vercel.app/)**. Create your free account, configure your dynamic JSON-Schema bounds, and generate your API Key. 
 
-*(Note: Aegis utilizes a decentralized architecture. The Cloud Console issues the tokens via the **[Control Plane](https://github.com/your-org/aegis-control-plane.git)**, and this Sidecar strictly enforces them).*
+*(Note: Aegis utilizes a decentralized architecture. The Cloud Console issues the tokens via the **[Control Plane](https://github.com/Yash-0620/aegis-control-plane.git)**, and this Sidecar strictly enforces them).*
 
 ### 2. Update your `docker-compose.yml`
 ```yaml
