@@ -10,37 +10,49 @@ The Aegis Sidecar is a hyper-lightweight, stateless Docker proxy that sits in fr
 
 **The Technical Moat:**
 - **Zero Cloud Latency:** Payloads are mathematically verified offline in `<2ms`. No external HTTP calls to a centralized server are made during execution.
-- **Deep Payload Inspection:** The proxy decrypts JSON-RPC payloads and enforces granular constraints (e.g., limiting Stripe refunds to under $500, restricting filesystem access to `.txt` files).
+- **Dynamic JSON-Schema Bounding:** The proxy is 100% tool-agnostic. It decrypts JSON-RPC payloads and strictly evaluates the mathematical shape, regex patterns, and numeric limits of the request against the CISO's universal JSON-Schema.
 - **Total Data Privacy:** Your enterprise LLM traffic never leaves your local network.
 
 ---
 
 ## 🚀 Zero-Code Deployment
 
-DevOps teams can deploy Aegis via a frictionless, 3-line drop-in solution to any existing Docker stack.
+DevOps teams can deploy Aegis via a frictionless drop-in solution to any existing Docker stack.
 
 ### 1. Define Policies & Get Your API Key
-Before deploying the sidecar, head to the **[Aegis Cloud Console](https://aegis-cloud-console.vercel.app/)**. Create your free account, configure your agent's cryptographic bounds, and generate your API Key. 
+Before deploying the sidecar, head to the **[Aegis Cloud Console](https://aegis-cloud-console.vercel.app/)**. Create your free account, configure your dynamic JSON-Schema bounds, and generate your API Key. 
 
 *(Note: Aegis utilizes a decentralized architecture. The Cloud Console issues the tokens via the **[Control Plane](https://github.com/your-org/aegis-control-plane.git)**, and this Sidecar strictly enforces them).*
 
 ### 2. Update your `docker-compose.yml`
 ```yaml
+version: '3.8'
+
 services:
-  # Your existing vulnerable MCP Server
+  # Your existing vulnerable MCP Server (Isolated)
   target-mcp:
     image: python:3.11-slim
     command: python -m http.server 8000
+    networks:
+      - aegis_secure_net
 
-  # The Aegis Edge Proxy (Drop-in)
+  # The Aegis Edge Proxy (Public Facing)
   aegis-sidecar:
-    image: aegis-mcp-sidecar:latest
+    image: ghcr.io/yash-0620/aegis-mcp-sidecar:latest
     ports:
       - "8080:8080"
     environment:
       - TARGET_MCP_URL=http://target-mcp:8000
+      - AEGIS_CONTROL_PLANE_URL=[https://aegis-live-node.onrender.com](https://aegis-live-node.onrender.com)
+      - AEGIS_AGENT_ID=<YOUR_AEGIS_API_KEY>
+    networks:
+      - aegis_secure_net
     depends_on:
       - target-mcp
+
+networks:
+  aegis_secure_net:
+    driver: bridge
 ```
 
 ### 3. Lock Down the Network
@@ -56,16 +68,18 @@ docker-compose up --build -d
 
 This architecture is built for high-throughput, cross-tenant isolation. We publicly document our testing suites to prove mathematical resilience. Check the `/tests` directory for:
 
-- `swarm_test.py`: Unleashes a 10-agent concurrent swarm to verify isolated thread contexts and 2ms response blockages.
-- `rogue_agent.py`: Simulates active prompt injections, unauthenticated network strikes, and massive out-of-bounds parameter hallucinations (e.g., attempting a $50,000 refund).
+- `test_universal_actions.py: Unleashes a multi-agent concurrent swarm to verify isolated thread contexts and 2ms response blockages.
+- `universal_e2e_test.py: Simulates active prompt injections, routing ghosts (404s), and out-of-bounds parameter hallucinations to verify the Universal JSON-Schema mathematical proxy.
 
 ### Example: Running a Rogue Agent Strike
 ```bash
-python tests/rogue_agent.py
+python tests/test_universal_actions.py
 
 # Expected Output:
-# --- FIRING HIJACKED AGENT STRIKE ---
-# Target: Stripe Refund | Attempted Amount: $50,000
-# Status: 403
-# Aegis Edge Proxy Response: Mathematical Bound Exceeded ($500 limit)
+# --- FIRING PAYLOAD TO SIDECAR ---
+# 🛡️ BLOCKED (Status 422): Sidecar intercepted schema violation!
+# Forensics: 'core-production-repo' does not match '^.*-dev-repo$'
+# Attack ($500 Refund) -> Status: 403 | Result: DENIED
+# Safe ($40 Refund) -> Status: 403 | Result: Sidecar Forwarded Payload
+# Attack (Hallucinated Param) -> Status: 403 | Result: DENIED
 ```
