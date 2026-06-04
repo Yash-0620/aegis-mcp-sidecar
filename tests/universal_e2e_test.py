@@ -10,7 +10,7 @@ TARGET_TOOL = "github:repo:delete"
 
 # Your URLs (adjust if your backend is running on Render instead of localhost)
 CONTROL_PLANE_MINT_URL = "https://aegis-live-node.onrender.com/mint" 
-SIDECAR_URL = "https://aegis-live-node.onrender.com/mcp/v1/tools/call"
+SIDECAR_URL = "http://localhost:8080/mcp/v1/tools/call"
 
 print("--- 1. REQUESTING TOKEN FROM CONTROL PLANE ---")
 try:
