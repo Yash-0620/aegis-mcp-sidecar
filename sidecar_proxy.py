@@ -1,27 +1,30 @@
 import json
 import os
 import re
+import time
 import jwt
+import asyncio
 from fastapi import FastAPI, Request, Response, HTTPException, status
 from fastapi.responses import JSONResponse, StreamingResponse
 import httpx
 from jsonschema import validate, ValidationError
-import asyncio
-import time
 
 app = FastAPI(title="Aegis Zero-Trust Universal Sidecar")
 
-# --- 1. Embedded Trust Root ---
-AEGIS_PUBLIC_KEY = """-----BEGIN PUBLIC KEY-----
+# --- 1. Embedded Trust Root & Config ---
+AEGIS_PUBLIC_KEY = os.environ.get("AEGIS_PUBLIC_KEY", """-----BEGIN PUBLIC KEY-----
 MCowBQYDK2VwAyEAjW1Lg7SRz2/K8ASyRhk9svTaJj7rtpTudllj7vCUIHU=
------END PUBLIC KEY-----"""
+-----END PUBLIC KEY-----""")
 
-# --- CONFIGURATION ---
 TARGET_MCP_URL = os.environ.get("TARGET_MCP_URL", "http://localhost:8000")
 TELEMETRY_URL = "https://aegis-live-node.onrender.com/telemetry/log_threat"
+CONTROL_PLANE_MINT_URL = os.environ.get("AEGIS_CONTROL_PLANE_URL", "https://aegis-live-node.onrender.com") + "/mint"
 
+# --- 2. Memory State ---
+TOKEN_CACHE = {}      # Caches API Key -> JWT exchanges for <2ms latency
+SESSION_AUTH_MAP = {} # Binds Cursor's raw session ID to the API Key
 
-# --- 2. Telemetry & Cryptography Core ---
+# --- 3. Telemetry & Cryptography Core ---
 async def log_telemetry(jwt_payload: dict, action: str, target: str, reason: str, status: str = "BLOCKED"):
     """Fire-and-forget telemetry for both Blocks and Allows."""
     async with httpx.AsyncClient() as client:
@@ -37,7 +40,6 @@ async def log_telemetry(jwt_payload: dict, action: str, target: str, reason: str
         except Exception as e:
             print(f"[Telemetry Warning] Could not sync telemetry: {e}")
 
-
 def verify_and_decode_token(token: str) -> dict:
     """Mathematically verifies the token signature at the edge using Ed25519."""
     try:
@@ -47,8 +49,26 @@ def verify_and_decode_token(token: str) -> dict:
     except jwt.InvalidTokenError:
         raise HTTPException(status_code=403, detail="Cryptographic signature verification failed")
 
+async def exchange_api_key_for_jwt(api_key: str) -> str:
+    current_time = time.time()
+    if api_key in TOKEN_CACHE:
+        cached = TOKEN_CACHE[api_key]
+        if cached["expires_at"] > current_time:
+            return cached["token"]
+            
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.post(CONTROL_PLANE_MINT_URL, json={"api_key": api_key}, timeout=3.0)
+            if response.status_code == 200:
+                token = response.json().get("token")
+                TOKEN_CACHE[api_key] = {"token": token, "expires_at": current_time + 240}
+                return token
+            else:
+                raise HTTPException(status_code=401, detail="Invalid API Key exchanged")
+        except httpx.RequestError as e:
+            raise HTTPException(status_code=502, detail=f"Control Plane unreachable: {str(e)}")
 
-# --- 3. Global Telemetry Middleware (The 404 Ghost Catcher) ---
+# --- 4. Global Telemetry Middleware ---
 @app.middleware("http")
 async def global_telemetry_logger(request: Request, call_next):
     """
@@ -88,68 +108,53 @@ async def global_telemetry_logger(request: Request, call_next):
         
     return response
 
-# --- 4. The SSE Handshake Forwarder ---
+# --- 5. The Buffered SSE Handshake Forwarder (Gzip Patched) ---
 @app.get("/sse")
 async def sse_handshake_forwarder(request: Request):
-    """
-    Passes the initial Cursor SSE handshake straight through to the isolated target MCP.
-    """
+    api_key = request.query_params.get("apiKey")
     target_url = f"{TARGET_MCP_URL}/sse"
-    client = httpx.AsyncClient()
     
+    # Safely extract all headers
+    headers = dict(request.headers)
+    headers["host"] = request.headers.get("host", "localhost:8080")
+    
+    # 1. Purge all possible casing variations of the encoding header
+    for key in list(headers.keys()):
+        if key.lower() == "accept-encoding":
+            del headers[key]
+            
+    # 2. EXPLICITLY force plain text to override httpx defaults
+    headers["Accept-Encoding"] = "identity"
+        
+    client = httpx.AsyncClient()
     try:
-        # Build and send the GET request to the hidden target server
-        req = client.build_request("GET", target_url)
+        req = client.build_request("GET", target_url, headers=headers)
         r = await client.send(req, stream=True)
         
-        # Stream the raw SSE connection back to Cursor
-        return StreamingResponse(r.aiter_raw(), headers=dict(r.headers))
+        async def event_stream_interceptor():
+            buffer = ""
+            async for chunk in r.aiter_raw():
+                try:
+                    text = chunk.decode("utf-8", errors="ignore")
+                    buffer += text
+                    if api_key and ("sessionId=" in buffer or "session_id=" in buffer):
+                        match = re.search(r'(?:sessionId|session_id)=([a-zA-Z0-9_-]+)', buffer)
+                        if match:
+                            session_id = match.group(1)
+                            if session_id not in SESSION_AUTH_MAP:
+                                SESSION_AUTH_MAP[session_id] = api_key
+                                print(f"[Aegis Auth] Successfully Bound Session {session_id} to API Key", flush=True)
+                except Exception:
+                    pass
+                yield chunk
+
+        return StreamingResponse(event_stream_interceptor(), headers=dict(r.headers))
     except Exception as e:
-        return JSONResponse(
-            status_code=502, 
-            content={"error": "Failed to establish SSE handshake with isolated target", "details": str(e)}
-        )
+        return JSONResponse(status_code=502, content={"error": "SSE Handshake Failed", "details": str(e)})
 
-
-# --- BYOA CACHE: In-Memory Auth Exchange ---
-# Stores exchanged API Keys to maintain <2ms latency and prevent spamming the Control Plane
-# Format: {"aegis_live_key": {"token": "eyJhbG...", "expires_at": 1700000000}}
-TOKEN_CACHE = {}
-CONTROL_PLANE_MINT_URL = os.environ.get("AEGIS_CONTROL_PLANE_URL", "https://aegis-live-node.onrender.com") + "/mint"
-
-async def exchange_api_key_for_jwt(api_key: str) -> str:
-    """Exchanges a raw BYOA Bearer API Key for a verifiable Ed25519 JWT."""
-    current_time = time.time()
-    
-    # 1. Check local cache first (under 4 min expiry)
-    if api_key in TOKEN_CACHE:
-        cached = TOKEN_CACHE[api_key]
-        if cached["expires_at"] > current_time:
-            return cached["token"]
-            
-    # 2. If not cached or expired, exchange with Control Plane
-    async with httpx.AsyncClient() as client:
-        try:
-            response = await client.post(CONTROL_PLANE_MINT_URL, json={"api_key": api_key}, timeout=3.0)
-            if response.status_code == 200:
-                token = response.json().get("token")
-                # Cache for 4 minutes (giving a 1 min safety buffer before actual 5 min expiry)
-                TOKEN_CACHE[api_key] = {"token": token, "expires_at": current_time + 240}
-                return token
-            else:
-                raise HTTPException(status_code=401, detail="Invalid API Key exchanged")
-        except httpx.RequestError as e:
-            raise HTTPException(status_code=502, detail=f"Control Plane unreachable: {str(e)}")
-
-
-# --- THE FACADE: Standard MCP JSON-RPC Forwarder ---
+# --- 6. The Facade JSON-RPC Forwarder ---
 @app.post("/messages/")
 async def mcp_message_forwarder(request: Request):
-    """
-    The Facade Route: Satisfies standard clients (Cursor, Anthropic).
-    Intercepts payloads, exchanges API keys for cryptographic JWTs, 
-    and forces the traffic through the V2 JSON-Schema Mathematical Pipe.
-    """
     body = await request.json()
     
     # --- 1. BYOA AUTH EXCHANGE ---
@@ -158,7 +163,11 @@ async def mcp_message_forwarder(request: Request):
         auth_header = request.headers.get("Authorization")
         if auth_header and auth_header.startswith("Bearer "):
             raw_key = auth_header.split(" ")[1]
-            # If it's a generic API Key (no dot notation like a JWT), exchange it silently!
+        else:
+            session_id = request.query_params.get("sessionId") or request.query_params.get("session_id")
+            raw_key = SESSION_AUTH_MAP.get(session_id)
+
+        if raw_key:
             if len(raw_key.split(".")) != 3: 
                 try:
                     token = await exchange_api_key_for_jwt(raw_key)
@@ -166,21 +175,20 @@ async def mcp_message_forwarder(request: Request):
                     asyncio.create_task(log_telemetry({}, "Auth", "Sidecar Edge", f"Key Exchange Failed: {e.detail}", "BLOCKED"))
                     return JSONResponse(status_code=e.status_code, content={"error": "Security violation", "message": e.detail})
             else:
-                token = raw_key # It was already an Aegis JWT
+                token = raw_key
 
     if not token:
-        asyncio.create_task(log_telemetry({}, "Auth", "Sidecar Edge", "Missing Security Context in Facade Route", "BLOCKED"))
-        return JSONResponse(status_code=401, content={"error": "Unauthorized", "message": "API Key or X-Aegis-IBCT required."})
+        asyncio.create_task(log_telemetry({}, "Auth", "Sidecar Edge", "Missing Security Context", "BLOCKED"))
+        return JSONResponse(status_code=401, content={"error": "Unauthorized", "message": "API Key required."})
 
-    # --- 2. CRYPTOGRAPHIC VERIFICATION (Edge Local) ---
+    # --- 2. CRYPTOGRAPHIC VERIFICATION ---
     try:
         claims = verify_and_decode_token(token)
     except HTTPException as e:
         asyncio.create_task(log_telemetry({}, "Auth", "Sidecar Edge", e.detail, "BLOCKED"))
         return JSONResponse(status_code=e.status_code, content={"error": "Security violation", "message": e.detail})
 
-
-    # --- 3. THE V2 INTERNAL PIPE (Mathematical JSON-Schema Guard) ---
+    # --- 3. THE V2 INTERNAL PIPE (Mathematical Guard) ---
     if body.get("method") == "tools/call":
         params = body.get("params", {})
         tool_name = params.get("name")
@@ -189,46 +197,36 @@ async def mcp_message_forwarder(request: Request):
         allowed_scopes = claims.get("allowed_scopes", [])
         schema_bounds = claims.get("schema_bounds", {})
         
-        # A. Scope Guard
         if tool_name not in allowed_scopes:
-            asyncio.create_task(log_telemetry(claims, tool_name, "Target API", "Scope Violation - Tool not authorized", "BLOCKED"))
-            return JSONResponse(status_code=403, content={"error": "Scope Violation", "message": f"Agent lacks authorization scope for '{tool_name}'"})
+            asyncio.create_task(log_telemetry(claims, tool_name, "Target API", "Scope Violation", "BLOCKED"))
+            return JSONResponse(status_code=403, content={"error": "Scope Violation"})
             
-        # B. Policy Verification
         tool_schema = schema_bounds.get(tool_name)
         if not tool_schema:
-            asyncio.create_task(log_telemetry(claims, tool_name, "Target API", "Policy Misconfiguration - No Bounds", "BLOCKED"))
-            return JSONResponse(status_code=403, content={"error": "Policy Misconfiguration", "message": f"No mathematical bounds defined for '{tool_name}'."})
+            asyncio.create_task(log_telemetry(claims, tool_name, "Target API", "Policy Misconfiguration", "BLOCKED"))
+            return JSONResponse(status_code=403, content={"error": "Policy Misconfiguration"})
             
-        # C. Mathematical Payload Validation
         target_str = json.dumps(tool_arguments)[:200]
         try:
             validate(instance=tool_arguments, schema=tool_schema)
-            # FIRE TELEMETRY: ALLOWED
-            asyncio.create_task(log_telemetry(claims, tool_name, target_str, "Mathematical bounds verified via Facade", "ALLOWED"))
+            asyncio.create_task(log_telemetry(claims, tool_name, target_str, "Mathematical bounds verified", "ALLOWED"))
         except ValidationError as e:
-            # MATHEMATICAL SHRED
             asyncio.create_task(log_telemetry(claims, tool_name, target_str, f"Schema breach: {e.message}", "BLOCKED"))
             return JSONResponse(
                 status_code=422,
-                content={
-                    "error": "Aegis Containment Breach",
-                    "message": "The AI tool payload structurally violated the CISO security schema.",
-                    "validation_error": e.message
-                }
+                content={"error": "Aegis Containment Breach", "validation_error": e.message}
             )
 
-    # --- 4. SECURE ROUTING (Only reached if math passes) ---
+    # --- 4. SECURE ROUTING ---
     target_url = f"{TARGET_MCP_URL}/messages/"
     async with httpx.AsyncClient() as client:
         response = await client.post(
             target_url,
             json=body,
-            params=request.query_params, # CRITICAL: Passes Cursor's ?sessionId= back to target
+            params=request.query_params,
             headers={"Content-Type": "application/json"}
         )
         return Response(content=response.content, status_code=response.status_code, headers=dict(response.headers))
-
 
 # --- 6. The Universal Validation Interceptor ---
 @app.post("/mcp/v1/tools/call")
