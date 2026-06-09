@@ -2,7 +2,7 @@ import json
 import os
 import jwt
 from fastapi import FastAPI, Request, Response, HTTPException, status
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 import httpx
 from jsonschema import validate, ValidationError
 import asyncio
@@ -86,8 +86,30 @@ async def global_telemetry_logger(request: Request, call_next):
         
     return response
 
+# --- 4. The SSE Handshake Forwarder ---
+@app.get("/sse")
+async def sse_handshake_forwarder(request: Request):
+    """
+    Passes the initial Cursor SSE handshake straight through to the isolated target MCP.
+    """
+    target_url = f"{TARGET_MCP_URL}/sse"
+    client = httpx.AsyncClient()
+    
+    try:
+        # Build and send the GET request to the hidden target server
+        req = client.build_request("GET", target_url)
+        r = await client.send(req, stream=True)
+        
+        # Stream the raw SSE connection back to Cursor
+        return StreamingResponse(r.aiter_raw(), headers=dict(r.headers))
+    except Exception as e:
+        return JSONResponse(
+            status_code=502, 
+            content={"error": "Failed to establish SSE handshake with isolated target", "details": str(e)}
+        )
 
-# --- 4. The Universal Validation Interceptor ---
+
+# --- 5. The Universal Validation Interceptor ---
 @app.post("/mcp/v1/tools/call")
 async def intercept_tool_call(request: Request):
     """
