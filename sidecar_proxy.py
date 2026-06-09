@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import jwt
 from fastapi import FastAPI, Request, Response, HTTPException, status
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -112,17 +113,40 @@ async def sse_handshake_forwarder(request: Request):
 @app.post("/messages/")
 async def mcp_message_forwarder(request: Request):
     """
-    Forwards MCP JSON-RPC messages (POST /messages/) to the target.
+    Intercepts MCP JSON-RPC messages, opens the envelope, enforces Aegis bounds, 
+    and forwards safe payloads to the target.
     """
-    target_url = f"{TARGET_MCP_URL}/messages/"
     body = await request.json()
     
+    # --- 1. THE AEGIS DEEP-PACKET INSPECTION ---
+    # Check if the AI is trying to execute a tool
+    if body.get("method") == "tools/call":
+        tool_name = body.get("params", {}).get("name")
+        arguments = body.get("params", {}).get("arguments", {})
+        
+        # If the AI targets the Postgres query tool, enforce the Read-Only Schema
+        if tool_name == "query":
+            sql_query = arguments.get("query", "")
+            
+            # The Mathematical Bound: MUST begin with SELECT, EXPLAIN, or ANALYZE
+            if not re.match(r"^(?i)\s*(SELECT|EXPLAIN|ANALYZE).*$", sql_query):
+                # MATHEMATICAL SHRED: Kill the payload immediately
+                return JSONResponse(
+                    status_code=422,
+                    content={
+                        "error": "Aegis Containment Breach",
+                        "message": "Unauthorized destructive payload intercepted in JSON-RPC envelope.",
+                        "blocked_payload": sql_query
+                    }
+                )
+
+    # --- 2. SECURE ROUTING (Only reached if safe) ---
+    target_url = f"{os.getenv('TARGET_MCP_URL')}/messages/"
     async with httpx.AsyncClient() as client:
-        # Forward the POST request to the internal Postgres MCP server
         response = await client.post(
             target_url,
             json=body,
-            params=request.query_params, # Important: keeps the session_id
+            params=request.query_params,
             headers={"Content-Type": "application/json"}
         )
         return Response(content=response.content, status_code=response.status_code)
