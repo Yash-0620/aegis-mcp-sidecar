@@ -108,8 +108,27 @@ async def sse_handshake_forwarder(request: Request):
             content={"error": "Failed to establish SSE handshake with isolated target", "details": str(e)}
         )
 
+# --- 5. The MCP JSON-RPC Forwarder ---
+@app.post("/messages/")
+async def mcp_message_forwarder(request: Request):
+    """
+    Forwards MCP JSON-RPC messages (POST /messages/) to the target.
+    """
+    target_url = f"{TARGET_MCP_URL}/messages/"
+    body = await request.json()
+    
+    async with httpx.AsyncClient() as client:
+        # Forward the POST request to the internal Postgres MCP server
+        response = await client.post(
+            target_url,
+            json=body,
+            params=request.query_params, # Important: keeps the session_id
+            headers={"Content-Type": "application/json"}
+        )
+        return Response(content=response.content, status_code=response.status_code)
 
-# --- 5. The Universal Validation Interceptor ---
+
+# --- 6. The Universal Validation Interceptor ---
 @app.post("/mcp/v1/tools/call")
 async def intercept_tool_call(request: Request):
     """
