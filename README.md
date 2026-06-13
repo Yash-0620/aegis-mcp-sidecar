@@ -1,19 +1,44 @@
-# Aegis MCP Sidecar | Stateless Cryptographic Edge Proxy
+# Aegis MCP Sidecar | Deterministic Authorization for AI Agents
 
 **Zero-Latency, Zero-Trust protection for the Model Context Protocol (MCP).**
 
-## ⚠️ The Threat Vector
-By default, MCP servers lack inherent Identity and Access Management (IAM). They blindly trust local traffic on port 8000. If an LLM is hijacked via prompt injection (or simply hallucinates), it has unfettered access to execute destructive functions, access local filesystems, or exfiltrate PII.
+Deploy autonomous AI agents with cryptographically enforced permissions.
+
+## ⚠️ The Problem
+Organizations increasingly want AI agents to perform real actions: query databases, execute workflows, manage infrastructure, and interact with internal tools.
+
+The challenge is not generating actions.
+
+The challenge is trusting those actions.
+
+Most AI systems rely on prompt-level instructions and application-layer guardrails. As agents gain access to production systems, teams need deterministic controls that define exactly what an agent is allowed to do.
 
 ## 🛡️ The Solution: Offline Asymmetric Verification
-The Aegis Sidecar is a hyper-lightweight, stateless Docker proxy that sits in front of your MCP server. It utilizes an **Ed25519 Public Key** to mathematically verify Invocation-Bound Capability Tokens (IBCTs) directly at the network edge. 
+Aegis is a stateless authorization sidecar for the Model Context Protocol (MCP).
 
-**The Technical Moat:**
-- **Zero Cloud Latency:** Payloads are mathematically verified offline in `<2ms`. No external HTTP calls to a centralized server are made during execution.
-- **Dynamic JSON-Schema Bounding:** The proxy is 100% tool-agnostic. It decrypts JSON-RPC payloads and strictly evaluates the mathematical shape, regex patterns, and numeric limits of the request against the CISO's universal JSON-Schema.
-- **Total Data Privacy:** Your enterprise LLM traffic never leaves your local network.
+Instead of trusting the LLM, Aegis evaluates every tool invocation at the network edge using cryptographic identity verification and policy enforcement.
+
+The sidecar sits in front of any MCP server and enforces explicit permissions before actions are executed.
+
+This enables organizations to safely move from AI assistants to AI operators.
+
+**Core Architecture:**
+- Ed25519 Identity-Bound Capability Tokens (IBCTs)
+- Stateless edge authorization
+- Dynamic JSON-Schema policy enforcement
+- Tool-agnostic MCP compatibility
+- Offline verification (<2ms)
+- No runtime dependency on external authorization services
+
+
+**Why It Matters:**
+Without deterministic authorization, organizations often keep agents trapped behind human approval workflows.
+
+Aegis provides a cryptographically enforced control layer that allows teams to safely grant agents access to real-world tools and infrastructure while maintaining strict operational boundaries.
+
 
 ---
+
 
 ## 🚀 Zero-Code Deployment
 
