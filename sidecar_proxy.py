@@ -8,8 +8,27 @@ from fastapi import FastAPI, Request, Response, HTTPException, status
 from fastapi.responses import JSONResponse, StreamingResponse
 import httpx
 from jsonschema import validate, ValidationError
+from contextlib import asynccontextmanager
 
-app = FastAPI(title="Aegis Zero-Trust Universal Sidecar")
+# --- GLOBAL CONNECTION POOL ---
+http_client: httpx.AsyncClient = None
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global http_client
+    # Initialize a persistent, highly concurrent connection pool
+    limits = httpx.Limits(max_keepalive_connections=100, max_connections=100)
+    # 5-second timeout, but the TCP connections stay warm
+    http_client = httpx.AsyncClient(limits=limits, timeout=5.0)
+    print("[Aegis Network] Persistent Connection Pool Initialized.", flush=True)
+    
+    yield # Server runs here
+    
+    # Clean up gracefully on shutdown
+    await http_client.aclose()
+    print("[Aegis Network] Connection Pool Closed.", flush=True)
+
+app = FastAPI(title="Aegis Zero-Trust Universal Sidecar", lifespan=lifespan)
 
 # --- 1. Embedded Trust Root & Config ---
 AEGIS_PUBLIC_KEY = os.environ.get("AEGIS_PUBLIC_KEY", """-----BEGIN PUBLIC KEY-----
@@ -26,19 +45,19 @@ SESSION_AUTH_MAP = {} # Binds Cursor's raw session ID to the API Key
 
 # --- 3. Telemetry & Cryptography Core ---
 async def log_telemetry(jwt_payload: dict, action: str, target: str, reason: str, status: str = "BLOCKED"):
-    """Fire-and-forget telemetry for both Blocks and Allows."""
-    async with httpx.AsyncClient() as client:
-        try:
-            await client.post(TELEMETRY_URL, json={
-                "user_id": jwt_payload.get("user_id", "Unknown-User"), 
-                "agent_id": jwt_payload.get("agent_id", "Unknown-Agent"), 
-                "action": action,
-                "target": target,  
-                "reason": reason,
-                "status": status
-            }, timeout=2.0)
-        except Exception as e:
-            print(f"[Telemetry Warning] Could not sync telemetry: {e}")
+    """Fire-and-forget telemetry using the persistent global connection pool."""
+    global http_client
+    try:
+        await http_client.post(TELEMETRY_URL, json={
+            "user_id": jwt_payload.get("user_id", "Unknown-User"), 
+            "agent_id": jwt_payload.get("agent_id", "Unknown-Agent"), 
+            "action": action,
+            "target": target,  
+            "reason": reason,
+            "status": status
+        })
+    except Exception as e:
+        print(f"[Telemetry Warning] Could not sync telemetry: {e}", flush=True)
 
 def verify_and_decode_token(token: str) -> dict:
     """Mathematically verifies the token signature at the edge using Ed25519."""
@@ -217,16 +236,24 @@ async def mcp_message_forwarder(request: Request):
                 content={"error": "Aegis Containment Breach", "validation_error": e.message}
             )
 
-    # --- 4. SECURE ROUTING ---
+    # --- 4. SECURE ROUTING (Using Warm Connection Pool) ---
+    global http_client
     target_url = f"{TARGET_MCP_URL}/messages/"
-    async with httpx.AsyncClient() as client:
-        response = await client.post(
+    
+    try:
+        response = await http_client.post(
             target_url,
             json=body,
             params=request.query_params,
             headers={"Content-Type": "application/json"}
         )
         return Response(content=response.content, status_code=response.status_code, headers=dict(response.headers))
+    except httpx.RequestError as e:
+        asyncio.create_task(log_telemetry(claims, "Network", "Target API", f"Infrastructure Error: {str(e)}", "ERROR"))
+        return JSONResponse(
+            status_code=502,
+            content={"error": "Infrastructure Error", "message": f"Could not route payload: {str(e)}"}
+        )
 
 # --- 6. The Universal Validation Interceptor ---
 @app.post("/mcp/v1/tools/call")
@@ -318,20 +345,18 @@ async def intercept_tool_call(request: Request):
     # FIRE TELEMETRY: ALLOWED (Schema Passed)
     asyncio.create_task(log_telemetry(claims, tool_name, target_str, "Mathematical bounds verified", "ALLOWED"))
 
-    # --- 6. Secure Routing ---
-    async with httpx.AsyncClient() as client:
-        try:
-            response = await client.post(
-                f"{TARGET_MCP_URL}/mcp/v1/tools/call",  # FIXED: Variable name corrected
-                json=body,
-                headers={"Content-Type": "application/json"},
-                timeout=5.0 
-            )
-            return Response(content=response.content, status_code=response.status_code, headers=dict(response.headers))
-        except httpx.RequestError as e:
-            # Optionally log the infrastructure failure as well
-            asyncio.create_task(log_telemetry(claims, tool_name, target_str, f"Infrastructure Error: {str(e)}", "ERROR"))
-            return JSONResponse(
-                status_code=status.HTTP_502_BAD_GATEWAY,
-                content={"error": "Infrastructure Error", "message": f"Could not route payload to target MCP server: {str(e)}"}
-            )
+    # --- 6. Secure Routing (Using Warm Connection Pool) ---
+    global http_client
+    try:
+        response = await http_client.post(
+            f"{TARGET_MCP_URL}/mcp/v1/tools/call",
+            json=body,
+            headers={"Content-Type": "application/json"}
+        )
+        return Response(content=response.content, status_code=response.status_code, headers=dict(response.headers))
+    except httpx.RequestError as e:
+        asyncio.create_task(log_telemetry(claims, tool_name, target_str, f"Infrastructure Error: {str(e)}", "ERROR"))
+        return JSONResponse(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            content={"error": "Infrastructure Error", "message": f"Could not route payload: {str(e)}"}
+        )
