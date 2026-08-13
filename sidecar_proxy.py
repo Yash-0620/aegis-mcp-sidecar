@@ -9,6 +9,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 import httpx
 from jsonschema import validate, ValidationError
 from contextlib import asynccontextmanager
+import uuid
 
 # --- GLOBAL CONNECTION POOL ---
 http_client: httpx.AsyncClient = None
@@ -44,20 +45,42 @@ TOKEN_CACHE = {}      # Caches API Key -> JWT exchanges for <2ms latency
 SESSION_AUTH_MAP = {} # Binds Cursor's raw session ID to the API Key
 
 # --- 3. Telemetry & Cryptography Core ---
-async def log_telemetry(jwt_payload: dict, action: str, target: str, reason: str, status: str = "BLOCKED"):
-    """Fire-and-forget telemetry using the persistent global connection pool."""
+async def log_telemetry(jwt_payload: dict, action: str, target: dict | str, reason: str, status: str = "BLOCKED"):
+    """Handles both stdout enterprise logging and Aegis UI telemetry sync."""
+    
+    # 1. Generate unique Correlation ID for MonkDB tracing
+    correlation_id = f"req_{uuid.uuid4().hex[:8]}"
+
+    # 2. Format the Resource Context (Handle both dicts and strings)
+    resource_context = target if isinstance(target, dict) else {"raw_target": str(target)}
+
+    # 3. Construct Venkat's exact required JSON format
+    stdout_log = {
+        "correlation_id": correlation_id,
+        "requesting_identity": jwt_payload.get("agent_id", jwt_payload.get("user_id", "Unknown-Agent")),
+        "tool_action": action,
+        "resource_context": resource_context,
+        "policy_decision": "DENY" if status == "BLOCKED" else "PERMIT",
+        "reason": reason
+    }
+
+    # 4. Print structured JSON to stdout for MonkDB's log aggregators
+    print(json.dumps(stdout_log), flush=True)
+
+    # 5. Fire-and-forget telemetry to Aegis Cloud Console (Supabase)
     global http_client
     try:
         await http_client.post(TELEMETRY_URL, json={
             "user_id": jwt_payload.get("user_id", "Unknown-User"), 
             "agent_id": jwt_payload.get("agent_id", "Unknown-Agent"), 
             "action": action,
-            "target": target,  
+            "target": str(target)[:200], # Keep our DB payload small
             "reason": reason,
             "status": status
         })
     except Exception as e:
-        print(f"[Telemetry Warning] Could not sync telemetry: {e}", flush=True)
+        # Don't let UI telemetry failure crash the enterprise sidecar
+        pass
 
 def verify_and_decode_token(token: str) -> dict:
     """Mathematically verifies the token signature at the edge using Ed25519."""
@@ -228,9 +251,9 @@ async def mcp_message_forwarder(request: Request):
         target_str = json.dumps(tool_arguments)[:200]
         try:
             validate(instance=tool_arguments, schema=tool_schema)
-            asyncio.create_task(log_telemetry(claims, tool_name, target_str, "Mathematical bounds verified", "ALLOWED"))
+            asyncio.create_task(log_telemetry(claims, tool_name, tool_arguments, "Mathematical bounds verified", "ALLOWED"))
         except ValidationError as e:
-            asyncio.create_task(log_telemetry(claims, tool_name, target_str, f"Schema breach: {e.message}", "BLOCKED"))
+            asyncio.create_task(log_telemetry(claims, tool_name, tool_arguments, f"Schema breach: {e.message}", "BLOCKED"))
             return JSONResponse(
                 status_code=422,
                 content={"error": "Aegis Containment Breach", "validation_error": e.message}
