@@ -40,56 +40,73 @@ TARGET_MCP_URL = os.environ.get("TARGET_MCP_URL", "http://localhost:8000")
 TELEMETRY_URL = "https://aegis-live-node.onrender.com/telemetry/log_threat"
 CONTROL_PLANE_MINT_URL = os.environ.get("AEGIS_CONTROL_PLANE_URL", "https://aegis-live-node.onrender.com") + "/mint"
 
+# --- UNIVERSAL OIDC IDENTITY CONFIGURATION ---
+EXTERNAL_IDP_SECRET = os.environ.get("EXTERNAL_IDP_SECRET") 
+REQUIRE_EXTERNAL_AUTH = os.environ.get("REQUIRE_EXTERNAL_AUTH", "false").lower() == "true"
+
 # --- 2. Memory State ---
-TOKEN_CACHE = {}      # Caches API Key -> JWT exchanges for <2ms latency
-SESSION_AUTH_MAP = {} # Binds Cursor's raw session ID to the API Key
+TOKEN_CACHE = {}       # Caches API Key -> JWT exchanges for <2ms latency
+SESSION_AUTH_MAP = {}  # Binds Cursor's raw session ID to the API Key
+NONCE_CACHE: dict[str, float] = {} # { jti: expiry_timestamp } for Replay Prevention
 
 # --- 3. Telemetry & Cryptography Core ---
+def clean_expired_nonces():
+    """TTL Eviction: Clears expired JTIs from memory to prevent memory leaks."""
+    now = time.time()
+    expired = [k for k, exp in list(NONCE_CACHE.items()) if exp < now]
+    for k in expired:
+        del NONCE_CACHE[k]
+
 async def log_telemetry(jwt_payload: dict, action: str, target: dict | str, reason: str, status: str = "BLOCKED"):
     """Handles both stdout enterprise logging and Aegis UI telemetry sync."""
-    
-    # 1. Generate unique Correlation ID for MonkDB tracing
     correlation_id = f"req_{uuid.uuid4().hex[:8]}"
-
-    # 2. Format the Resource Context (Handle both dicts and strings)
     resource_context = target if isinstance(target, dict) else {"raw_target": str(target)}
-
-    # 3. Construct Venkat's exact required JSON format
+    
     stdout_log = {
         "correlation_id": correlation_id,
-        "requesting_identity": jwt_payload.get("agent_id", jwt_payload.get("user_id", "Unknown-Agent")),
+        "requesting_identity": jwt_payload.get("agent_id", jwt_payload.get("sub", jwt_payload.get("user_id", "Unknown-Agent"))),
         "tool_action": action,
         "resource_context": resource_context,
         "policy_decision": "DENY" if status == "BLOCKED" else "PERMIT",
         "reason": reason
     }
-
-    # 4. Print structured JSON to stdout for MonkDB's log aggregators
     print(json.dumps(stdout_log), flush=True)
-
-    # 5. Fire-and-forget telemetry to Aegis Cloud Console (Supabase)
+    
     global http_client
     try:
         await http_client.post(TELEMETRY_URL, json={
             "user_id": jwt_payload.get("user_id", "Unknown-User"), 
-            "agent_id": jwt_payload.get("agent_id", "Unknown-Agent"), 
+            "agent_id": jwt_payload.get("agent_id", jwt_payload.get("sub", "Unknown-Agent")), 
             "action": action,
-            "target": str(target)[:200], # Keep our DB payload small
+            "target": str(target)[:200],
             "reason": reason,
             "status": status
         })
-    except Exception as e:
-        # Don't let UI telemetry failure crash the enterprise sidecar
+    except Exception:
         pass
 
 def verify_and_decode_token(token: str) -> dict:
-    """Mathematically verifies the token signature at the edge using Ed25519."""
+    """Mathematically verifies token signature, expiration, and replay prevention at the edge."""
     try:
-        return jwt.decode(token, AEGIS_PUBLIC_KEY, algorithms=["EdDSA"])
+        # We explicitly require the 'exp' claim for deterministic bounding
+        claims = jwt.decode(token, AEGIS_PUBLIC_KEY, algorithms=["EdDSA"], options={"require": ["exp"]})
     except jwt.ExpiredSignatureError:
         raise HTTPException(status_code=401, detail="Token signature has expired")
+    except jwt.MissingRequiredClaimError:
+        raise HTTPException(status_code=403, detail="Cryptographic signature verification failed: Missing 'exp' claim")
     except jwt.InvalidTokenError:
         raise HTTPException(status_code=403, detail="Cryptographic signature verification failed")
+
+    # JTI Replay Prevention Check
+    jti = claims.get("jti")
+    if jti:
+        clean_expired_nonces()
+        if jti in NONCE_CACHE:
+            raise HTTPException(status_code=409, detail="Replay Attack Detected: Capability token has already been consumed")
+        # Cache the JTI with its expiration timestamp
+        NONCE_CACHE[jti] = float(claims.get("exp", time.time() + 300))
+
+    return claims
 
 async def exchange_api_key_for_jwt(api_key: str) -> str:
     current_time = time.time()
@@ -110,36 +127,54 @@ async def exchange_api_key_for_jwt(api_key: str) -> str:
         except httpx.RequestError as e:
             raise HTTPException(status_code=502, detail=f"Control Plane unreachable: {str(e)}")
 
+def extract_and_validate_external_identity(request: Request):
+    """
+    Agnostic OIDC validation. Returns (caller_identity, error_response).
+    This ensures Aegis can generically pin capabilities to identities (like Entra ID, Okta, etc.)
+    without hardcoding specific providers or breaking BYOA fallback logic.
+    """
+    if not EXTERNAL_IDP_SECRET:
+        return None, None
+        
+    # To avoid breaking BYOA (where Authorization is the Aegis Key), 
+    # we only process External IDP if X-Aegis-IBCT is explicitly provided.
+    if not request.headers.get("X-Aegis-IBCT"):
+        return None, None
+
+    auth_header = request.headers.get("Authorization")
+    if auth_header and auth_header.startswith("Bearer "):
+        ext_token = auth_header.split(" ")[1]
+        try:
+            # Agnostic to specific IDP algorithms, supporting common standard symmetric/asymmetric
+            ext_claims = jwt.decode(ext_token, EXTERNAL_IDP_SECRET, algorithms=["HS256", "RS256", "RS384", "RS512"])
+            return ext_claims.get("sub"), None
+        except jwt.PyJWTError as e:
+            if REQUIRE_EXTERNAL_AUTH:
+                return None, JSONResponse(status_code=401, content={"error": "Unauthorized", "message": f"Invalid External Identity JWT: {str(e)}"})
+    elif REQUIRE_EXTERNAL_AUTH:
+        return None, JSONResponse(status_code=401, content={"error": "Unauthorized", "message": "Missing Authorization header for external identity"})
+    
+    return None, None
+
 # --- 4. Global Telemetry Middleware ---
 @app.middleware("http")
 async def global_telemetry_logger(request: Request, call_next):
-    """
-    Catches requests that fail at the ASGI routing layer (e.g., 404 Not Found)
-    and forcibly extracts the token to bypass Supabase RLS for the UI.
-    """
+    """Catches requests that fail at the ASGI routing layer (e.g., 404 Not Found)"""
     response = await call_next(request)
     
-    # Catch Ghost Requests (404) or Method Not Allowed (405)
     if response.status_code in [404, 405]:
-        
-        # 1. We MUST try to extract the token to attribute the attack to the correct CISO dashboard
         token = request.headers.get("X-Aegis-IBCT")
         if not token:
             auth_header = request.headers.get("Authorization")
             if auth_header and auth_header.startswith("Bearer "):
                 token = auth_header.split(" ")[1]
-
-        # 2. Extract claims purely to grab the user_id for UI routing
         claims = {}
         if token:
             try:
-                # We decode without verifying signature ONLY because the request is already blocked (404).
-                # We just need to know whose dashboard to send the warning to.
                 claims = jwt.decode(token, options={"verify_signature": False})
             except Exception:
-                pass # If the token is complete garbage, fail gracefully
+                pass 
                 
-        # 3. Fire telemetry with the CISO's identity attached
         asyncio.create_task(log_telemetry(
             jwt_payload=claims, 
             action=f"INVALID_ROUTE: {request.url.path}", 
@@ -156,18 +191,15 @@ async def sse_handshake_forwarder(request: Request):
     api_key = request.query_params.get("apiKey")
     target_url = f"{TARGET_MCP_URL}/sse"
     
-    # Safely extract all headers
     headers = dict(request.headers)
     headers["host"] = request.headers.get("host", "localhost:8080")
     
-    # 1. Purge all possible casing variations of the encoding header
     for key in list(headers.keys()):
         if key.lower() == "accept-encoding":
             del headers[key]
             
-    # 2. EXPLICITLY force plain text to override httpx defaults
     headers["Accept-Encoding"] = "identity"
-        
+            
     client = httpx.AsyncClient()
     try:
         req = client.build_request("GET", target_url, headers=headers)
@@ -189,7 +221,6 @@ async def sse_handshake_forwarder(request: Request):
                 except Exception:
                     pass
                 yield chunk
-
         return StreamingResponse(event_stream_interceptor(), headers=dict(r.headers))
     except Exception as e:
         return JSONResponse(status_code=502, content={"error": "SSE Handshake Failed", "details": str(e)})
@@ -208,7 +239,6 @@ async def mcp_message_forwarder(request: Request):
         else:
             session_id = request.query_params.get("sessionId") or request.query_params.get("session_id")
             raw_key = SESSION_AUTH_MAP.get(session_id)
-
         if raw_key:
             if len(raw_key.split(".")) != 3: 
                 try:
@@ -218,10 +248,14 @@ async def mcp_message_forwarder(request: Request):
                     return JSONResponse(status_code=e.status_code, content={"error": "Security violation", "message": e.detail})
             else:
                 token = raw_key
-
     if not token:
         asyncio.create_task(log_telemetry({}, "Auth", "Sidecar Edge", "Missing Security Context", "BLOCKED"))
         return JSONResponse(status_code=401, content={"error": "Unauthorized", "message": "API Key required."})
+
+    # --- 1.5 EXTERNAL OIDC IDENTITY & PINNING ---
+    caller_identity, error_response = extract_and_validate_external_identity(request)
+    if error_response:
+        return error_response
 
     # --- 2. CRYPTOGRAPHIC VERIFICATION ---
     try:
@@ -229,6 +263,13 @@ async def mcp_message_forwarder(request: Request):
     except HTTPException as e:
         asyncio.create_task(log_telemetry({}, "Auth", "Sidecar Edge", e.detail, "BLOCKED"))
         return JSONResponse(status_code=e.status_code, content={"error": "Security violation", "message": e.detail})
+
+    # Check Pinning
+    pinned_sub = claims.get("sub")
+    if pinned_sub and EXTERNAL_IDP_SECRET and caller_identity:
+        if pinned_sub != caller_identity:
+            asyncio.create_task(log_telemetry(claims, "Auth", "Sidecar Edge", "Capability Theft Detected", "BLOCKED"))
+            return JSONResponse(status_code=403, content={"error": "Capability Theft Detected", "message": f"IBCT pinned to '{pinned_sub}', invoked by '{caller_identity}'"})
 
     # --- 3. THE V2 INTERNAL PIPE (Mathematical Guard) ---
     if body.get("method") == "tools/call":
@@ -248,7 +289,6 @@ async def mcp_message_forwarder(request: Request):
             asyncio.create_task(log_telemetry(claims, tool_name, "Target API", "Policy Misconfiguration", "BLOCKED"))
             return JSONResponse(status_code=403, content={"error": "Policy Misconfiguration"})
             
-        target_str = json.dumps(tool_arguments)[:200]
         try:
             validate(instance=tool_arguments, schema=tool_schema)
             asyncio.create_task(log_telemetry(claims, tool_name, tool_arguments, "Mathematical bounds verified", "ALLOWED"))
@@ -263,12 +303,21 @@ async def mcp_message_forwarder(request: Request):
     global http_client
     target_url = f"{TARGET_MCP_URL}/messages/"
     
+    headers_to_forward = {"Content-Type": "application/json"}
+    if caller_identity:
+        headers_to_forward["x-aegis-identity"] = caller_identity
+    elif claims.get("agent_id"):
+        headers_to_forward["x-aegis-identity"] = claims.get("agent_id")
+        
+    if request.headers.get("x-correlation-id"):
+        headers_to_forward["x-correlation-id"] = request.headers.get("x-correlation-id")
+
     try:
         response = await http_client.post(
             target_url,
             json=body,
             params=request.query_params,
-            headers={"Content-Type": "application/json"}
+            headers=headers_to_forward
         )
         return Response(content=response.content, status_code=response.status_code, headers=dict(response.headers))
     except httpx.RequestError as e:
@@ -278,21 +327,19 @@ async def mcp_message_forwarder(request: Request):
             content={"error": "Infrastructure Error", "message": f"Could not route payload: {str(e)}"}
         )
 
-# --- 6. The Universal Validation Interceptor ---
+# --- 7. The Universal Validation Interceptor ---
 @app.post("/mcp/v1/tools/call")
 async def intercept_tool_call(request: Request):
     """
     Universal network-layer interceptor. Handles ANY tool call format
     by analyzing the mathematical shape of the JSON parameters.
     """
-    
     # 1. Extract the Invocation-Bound Capability Token (IBCT)
     token = request.headers.get("X-Aegis-IBCT")
     if not token:
         auth_header = request.headers.get("Authorization")
         if auth_header and auth_header.startswith("Bearer "):
             token = auth_header.split(" ")[1]
-
     if not token:
         asyncio.create_task(log_telemetry({}, "Auth", "Sidecar Edge", "Missing Security Context", "BLOCKED"))
         return JSONResponse(
@@ -300,12 +347,24 @@ async def intercept_tool_call(request: Request):
             content={"error": "Missing Security Context", "message": "X-Aegis-IBCT or Bearer Token required"}
         )
 
+    # --- 1.5 EXTERNAL OIDC IDENTITY & PINNING ---
+    caller_identity, error_response = extract_and_validate_external_identity(request)
+    if error_response:
+        return error_response
+
     # 2. Extract and cryptographically verify claims locally
     try:
         claims = verify_and_decode_token(token)
     except HTTPException as e:
         asyncio.create_task(log_telemetry({}, "Auth", "Sidecar Edge", e.detail, "BLOCKED"))
         return JSONResponse(status_code=e.status_code, content={"error": "Security violation", "message": e.detail})
+
+    # Check Pinning
+    pinned_sub = claims.get("sub")
+    if pinned_sub and EXTERNAL_IDP_SECRET and caller_identity:
+        if pinned_sub != caller_identity:
+            asyncio.create_task(log_telemetry(claims, "Auth", "Sidecar Edge", "Capability Theft Detected", "BLOCKED"))
+            return JSONResponse(status_code=403, content={"error": "Capability Theft Detected", "message": f"IBCT pinned to '{pinned_sub}', invoked by '{caller_identity}'"})
 
     allowed_scopes = claims.get("allowed_scopes", [])
     schema_bounds = claims.get("schema_bounds", {})
@@ -330,27 +389,19 @@ async def intercept_tool_call(request: Request):
         asyncio.create_task(log_telemetry(claims, tool_name, "Target API", "Scope Violation - Tool not authorized", "BLOCKED"))
         return JSONResponse(
             status_code=status.HTTP_403_FORBIDDEN,
-            content={
-                "error": "Scope Violation", 
-                "message": f"Agent identity lacks authorization scope for tool: '{tool_name}'"
-            }
+            content={"error": "Scope Violation", "message": f"Agent identity lacks authorization scope for tool: '{tool_name}'"}
         )
 
     # 5. Schema Guard: Does the payload match the mathematical constraints?
     tool_schema = schema_bounds.get(tool_name)
-    
     if not tool_schema:
         asyncio.create_task(log_telemetry(claims, tool_name, "Target API", "Policy Misconfiguration - No Schema Bounds", "BLOCKED"))
         return JSONResponse(
             status_code=status.HTTP_403_FORBIDDEN,
-            content={
-                "error": "Policy Misconfiguration", 
-                "message": f"No JSON-Schema bounds defined for authorized scope: '{tool_name}'. Failing closed."
-            }
+            content={"error": "Policy Misconfiguration", "message": f"No JSON-Schema bounds defined for authorized scope: '{tool_name}'. Failing closed."}
         )
 
     target_str = json.dumps(tool_arguments)[:200]
-
     try:
         # PURE MATHEMATICAL VALIDATION
         validate(instance=tool_arguments, schema=tool_schema)
@@ -358,23 +409,28 @@ async def intercept_tool_call(request: Request):
         asyncio.create_task(log_telemetry(claims, tool_name, target_str, f"Schema breach: {e.message}", "BLOCKED"))
         return JSONResponse(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            content={
-                "error": "Aegis Bounded Containment Breach",
-                "message": "The AI tool payload structurally violated the CISO security schema.",
-                "validation_error": e.message
-            }
+            content={"error": "Aegis Bounded Containment Breach", "message": "The AI tool payload structurally violated the CISO security schema.", "validation_error": e.message}
         )
-    
-    # FIRE TELEMETRY: ALLOWED (Schema Passed)
+        
     asyncio.create_task(log_telemetry(claims, tool_name, target_str, "Mathematical bounds verified", "ALLOWED"))
 
-    # --- 6. Secure Routing (Using Warm Connection Pool) ---
+    # --- 6. Secure Routing ---
     global http_client
+    
+    headers_to_forward = {"Content-Type": "application/json"}
+    if caller_identity:
+        headers_to_forward["x-aegis-identity"] = caller_identity
+    elif claims.get("agent_id"):
+        headers_to_forward["x-aegis-identity"] = claims.get("agent_id")
+        
+    if request.headers.get("x-correlation-id"):
+        headers_to_forward["x-correlation-id"] = request.headers.get("x-correlation-id")
+
     try:
         response = await http_client.post(
             f"{TARGET_MCP_URL}/mcp/v1/tools/call",
             json=body,
-            headers={"Content-Type": "application/json"}
+            headers=headers_to_forward
         )
         return Response(content=response.content, status_code=response.status_code, headers=dict(response.headers))
     except httpx.RequestError as e:
