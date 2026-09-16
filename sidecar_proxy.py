@@ -53,7 +53,7 @@ def clean_expired_nonces():
         del NONCE_CACHE[k]
 
 def get_unverified_claims(request: Request) -> dict:
-    """Extracts payload without verifying so we can log to the correct CISO dashboard on auth failures."""
+    """Bulletproof extraction that ignores all cryptographic/time errors to ensure we get the ID for logging."""
     token = request.headers.get("X-Aegis-IBCT")
     if not token:
         auth_header = request.headers.get("Authorization")
@@ -61,7 +61,13 @@ def get_unverified_claims(request: Request) -> dict:
             token = auth_header.split(" ")[1]
     if token:
         try:
-            return jwt.decode(token, options={"verify_signature": False})
+            return jwt.decode(token, options={
+                "verify_signature": False, 
+                "verify_exp": False, 
+                "verify_nbf": False, 
+                "verify_aud": False, 
+                "verify_iss": False
+            })
         except Exception:
             pass
     return {}
@@ -91,12 +97,13 @@ async def log_telemetry(jwt_payload: dict, action: str, target: dict | str, reas
                 "reason": reason,
                 "status": status
             })
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[Telemetry Warning] Cloud sync failed: {e}", flush=True)
 
 def verify_and_decode_token(token: str) -> dict:
     try:
-        claims = jwt.decode(token, AEGIS_PUBLIC_KEY, algorithms=["EdDSA"])
+        # Added leeway=300 to forgive up to 5 minutes of Docker clock drift
+        claims = jwt.decode(token, AEGIS_PUBLIC_KEY, algorithms=["EdDSA"], leeway=300)
     except jwt.ExpiredSignatureError:
         raise HTTPException(status_code=401, detail="Token signature has expired")
     except jwt.InvalidTokenError as e:
@@ -130,7 +137,8 @@ async def exchange_api_key_for_jwt(api_key: str) -> str:
         except httpx.RequestError as e:
             raise HTTPException(status_code=502, detail=f"Control Plane unreachable: {str(e)}")
 
-def extract_and_validate_external_identity(request: Request):
+async def extract_and_validate_external_identity(request: Request):
+    """Agnostic OIDC identity and role validation."""
     if not EXTERNAL_IDP_SECRET:
         return None, None
 
@@ -138,24 +146,24 @@ def extract_and_validate_external_identity(request: Request):
     if auth_header and auth_header.startswith("Bearer "):
         ext_token = auth_header.split(" ")[1]
         try:
-            # verify_aud=False prevents crashes when external tokens have audiences we don't care about
-            ext_claims = jwt.decode(ext_token, EXTERNAL_IDP_SECRET, algorithms=["HS256", "RS256", "RS384", "RS512"], options={"verify_aud": False, "verify_iss": False})
+            # leeway=300 prevents ImmatureSignatureError on Entra tokens due to clock skew
+            ext_claims = jwt.decode(ext_token, EXTERNAL_IDP_SECRET, algorithms=["HS256", "RS256", "RS384", "RS512"], leeway=300, options={"verify_aud": False, "verify_iss": False})
             
             if REQUIRED_EXTERNAL_ROLE:
                 roles = ext_claims.get("roles", [])
                 if REQUIRED_EXTERNAL_ROLE not in roles:
                     err_msg = f"Caller lacks required role: {REQUIRED_EXTERNAL_ROLE}"
-                    asyncio.create_task(log_telemetry(get_unverified_claims(request), "Authentication", "Proxy", err_msg, "BLOCKED"))
+                    await log_telemetry(get_unverified_claims(request), "Authentication", "Proxy", err_msg, "BLOCKED")
                     return None, JSONResponse(status_code=status.HTTP_403_FORBIDDEN, content={"error": "Forbidden", "message": err_msg})
             return ext_claims.get("sub"), None
         except jwt.PyJWTError as e:
             if REQUIRE_EXTERNAL_AUTH:
                 err_msg = f"Invalid Identity JWT: {str(e)}"
-                asyncio.create_task(log_telemetry(get_unverified_claims(request), "Authentication", "Proxy", err_msg, "BLOCKED"))
+                await log_telemetry(get_unverified_claims(request), "Authentication", "Proxy", err_msg, "BLOCKED")
                 return None, JSONResponse(status_code=status.HTTP_401_UNAUTHORIZED, content={"error": "Unauthorized", "message": err_msg})
     elif REQUIRE_EXTERNAL_AUTH:
         err_msg = "Missing Authorization header"
-        asyncio.create_task(log_telemetry(get_unverified_claims(request), "Authentication", "Proxy", err_msg, "BLOCKED"))
+        await log_telemetry(get_unverified_claims(request), "Authentication", "Proxy", err_msg, "BLOCKED")
         return None, JSONResponse(status_code=status.HTTP_401_UNAUTHORIZED, content={"error": "Unauthorized", "message": err_msg})
     
     return None, None
@@ -166,7 +174,7 @@ async def global_telemetry_logger(request: Request, call_next):
     response = await call_next(request)
     if response.status_code in [404, 405]:
         claims = get_unverified_claims(request)
-        asyncio.create_task(log_telemetry(claims, f"INVALID_ROUTE: {request.url.path}", "Sidecar Edge", f"{response.status_code} - Invalid route", "BLOCKED"))
+        await log_telemetry(claims, f"INVALID_ROUTE: {request.url.path}", "Sidecar Edge", f"{response.status_code} - Invalid route", "BLOCKED")
     return response
 
 # --- 5. SSE Handshake Forwarder ---
@@ -225,29 +233,29 @@ async def mcp_message_forwarder(request: Request):
                 try:
                     token = await exchange_api_key_for_jwt(raw_key)
                 except HTTPException as e:
-                    asyncio.create_task(log_telemetry(get_unverified_claims(request), "Auth", "Proxy", f"Key Exchange Failed: {e.detail}", "BLOCKED"))
+                    await log_telemetry(get_unverified_claims(request), "Auth", "Proxy", f"Key Exchange Failed: {e.detail}", "BLOCKED")
                     return JSONResponse(status_code=e.status_code, content={"error": "Security violation", "message": e.detail})
             else:
                 token = raw_key
     if not token:
-        asyncio.create_task(log_telemetry({}, "Auth", "Proxy", "Missing API Key", "BLOCKED"))
+        await log_telemetry({}, "Auth", "Proxy", "Missing API Key", "BLOCKED")
         return JSONResponse(status_code=401, content={"error": "Unauthorized", "message": "API Key required."})
 
-    caller_identity, error_response = extract_and_validate_external_identity(request)
+    caller_identity, error_response = await extract_and_validate_external_identity(request)
     if error_response:
         return error_response
 
     try:
         claims = verify_and_decode_token(token)
     except HTTPException as e:
-        asyncio.create_task(log_telemetry(get_unverified_claims(request), "Capability Breach", "Proxy", e.detail, "BLOCKED"))
+        await log_telemetry(get_unverified_claims(request), "Capability Breach", "Proxy", e.detail, "BLOCKED")
         return JSONResponse(status_code=e.status_code, content={"error": "Security violation", "message": e.detail})
 
     pinned_sub = claims.get("sub")
     if pinned_sub and EXTERNAL_IDP_SECRET and caller_identity:
         if pinned_sub != caller_identity:
             err_msg = f"IBCT pinned to '{pinned_sub}', invoked by '{caller_identity}'"
-            asyncio.create_task(log_telemetry(claims, "Auth", "Proxy", f"Capability Theft: {err_msg}", "BLOCKED"))
+            await log_telemetry(claims, "Auth", "Proxy", f"Capability Theft: {err_msg}", "BLOCKED")
             return JSONResponse(status_code=403, content={"error": "Capability Theft Detected", "message": err_msg})
 
     if body.get("method") == "tools/call":
@@ -259,19 +267,19 @@ async def mcp_message_forwarder(request: Request):
         schema_bounds = claims.get("schema_bounds", {})
         
         if tool_name not in allowed_scopes:
-            asyncio.create_task(log_telemetry(claims, tool_name, "Target API", "Scope Violation", "BLOCKED"))
+            await log_telemetry(claims, tool_name, "Target API", "Scope Violation", "BLOCKED")
             return JSONResponse(status_code=403, content={"error": "Scope Violation"})
             
         tool_schema = schema_bounds.get(tool_name)
         if not tool_schema:
-            asyncio.create_task(log_telemetry(claims, tool_name, "Target API", "Policy Misconfiguration", "BLOCKED"))
+            await log_telemetry(claims, tool_name, "Target API", "Policy Misconfiguration", "BLOCKED")
             return JSONResponse(status_code=403, content={"error": "Policy Misconfiguration"})
             
         try:
             validate(instance=tool_arguments, schema=tool_schema)
             asyncio.create_task(log_telemetry(claims, tool_name, tool_arguments, "Mathematical bounds verified", "ALLOWED"))
         except ValidationError as e:
-            asyncio.create_task(log_telemetry(claims, tool_name, tool_arguments, f"Schema breach: {e.message}", "BLOCKED"))
+            await log_telemetry(claims, tool_name, tool_arguments, f"Schema breach: {e.message}", "BLOCKED")
             return JSONResponse(status_code=422, content={"error": "Aegis Containment Breach", "validation_error": e.message})
 
     global http_client
@@ -289,7 +297,7 @@ async def mcp_message_forwarder(request: Request):
         response = await http_client.post(target_url, json=body, params=request.query_params, headers=headers_to_forward)
         return Response(content=response.content, status_code=response.status_code, headers=dict(response.headers))
     except httpx.RequestError as e:
-        asyncio.create_task(log_telemetry(claims, "Network", "Target API", f"Infrastructure Error: {str(e)}", "ERROR"))
+        await log_telemetry(claims, "Network", "Target API", f"Infrastructure Error: {str(e)}", "ERROR")
         return JSONResponse(status_code=502, content={"error": "Infrastructure Error", "message": str(e)})
 
 # --- 7. Universal Validation Interceptor ---
@@ -302,24 +310,24 @@ async def intercept_tool_call(request: Request):
             token = auth_header.split(" ")[1]
     if not token:
         err_msg = "X-Aegis-IBCT or Bearer Token required"
-        asyncio.create_task(log_telemetry({}, "Authentication", "Proxy", err_msg, "BLOCKED"))
+        await log_telemetry({}, "Authentication", "Proxy", err_msg, "BLOCKED")
         return JSONResponse(status_code=status.HTTP_401_UNAUTHORIZED, content={"error": "Missing Security Context", "message": err_msg})
 
-    caller_identity, error_response = extract_and_validate_external_identity(request)
+    caller_identity, error_response = await extract_and_validate_external_identity(request)
     if error_response:
         return error_response
 
     try:
         claims = verify_and_decode_token(token)
     except HTTPException as e:
-        asyncio.create_task(log_telemetry(get_unverified_claims(request), "Capability Verification", "Proxy", e.detail, "BLOCKED"))
+        await log_telemetry(get_unverified_claims(request), "Capability Verification", "Proxy", e.detail, "BLOCKED")
         return JSONResponse(status_code=e.status_code, content={"error": "Capability Breach", "message": e.detail})
 
     pinned_sub = claims.get("sub")
     if pinned_sub and EXTERNAL_IDP_SECRET and caller_identity:
         if pinned_sub != caller_identity:
             err_msg = f"IBCT pinned to '{pinned_sub}', invoked by '{caller_identity}'"
-            asyncio.create_task(log_telemetry(claims, "Authentication", "Proxy", f"Capability Theft Detected: {err_msg}", "BLOCKED"))
+            await log_telemetry(claims, "Authentication", "Proxy", f"Capability Theft Detected: {err_msg}", "BLOCKED")
             return JSONResponse(status_code=status.HTTP_403_FORBIDDEN, content={"error": "Capability Theft Detected", "message": err_msg})
 
     allowed_scopes = claims.get("allowed_scopes", [])
@@ -328,7 +336,7 @@ async def intercept_tool_call(request: Request):
     try:
         body = await request.json()
     except json.JSONDecodeError:
-        asyncio.create_task(log_telemetry(claims, "Payload Processing", "Proxy", "Malformed JSON", "BLOCKED"))
+        await log_telemetry(claims, "Payload Processing", "Proxy", "Malformed JSON", "BLOCKED")
         return JSONResponse(status_code=400, content={"error": "Invalid payload", "message": "Malformed JSON"})
 
     params = body.get("params") or body
@@ -336,26 +344,27 @@ async def intercept_tool_call(request: Request):
     tool_arguments = params.get("arguments", {})
 
     if not tool_name:
-        asyncio.create_task(log_telemetry(claims, "Payload Processing", "Proxy", "Missing target tool name", "BLOCKED"))
+        await log_telemetry(claims, "Payload Processing", "Proxy", "Missing target tool name", "BLOCKED")
         return JSONResponse(status_code=400, content={"error": "Invalid protocol", "message": "Missing target tool name"})
 
     if tool_name not in allowed_scopes:
         err_msg = f"Tool '{tool_name}' not in allowed scopes"
-        asyncio.create_task(log_telemetry(claims, tool_name, "Target API", f"Scope Violation: {err_msg}", "BLOCKED"))
+        await log_telemetry(claims, tool_name, "Target API", f"Scope Violation: {err_msg}", "BLOCKED")
         return JSONResponse(status_code=status.HTTP_403_FORBIDDEN, content={"error": "Scope Violation", "message": err_msg})
 
     tool_schema = schema_bounds.get(tool_name)
     if not tool_schema:
         err_msg = f"No Schema Bounds for '{tool_name}'"
-        asyncio.create_task(log_telemetry(claims, tool_name, "Target API", f"Policy Misconfiguration: {err_msg}", "BLOCKED"))
+        await log_telemetry(claims, tool_name, "Target API", f"Policy Misconfiguration: {err_msg}", "BLOCKED")
         return JSONResponse(status_code=status.HTTP_403_FORBIDDEN, content={"error": "Policy Misconfiguration", "message": err_msg})
 
     try:
         validate(instance=tool_arguments, schema=tool_schema)
     except ValidationError as e:
-        asyncio.create_task(log_telemetry(claims, tool_name, tool_arguments, f"Schema breach: {e.message}", "BLOCKED"))
+        await log_telemetry(claims, tool_name, tool_arguments, f"Schema breach: {e.message}", "BLOCKED")
         return JSONResponse(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, content={"error": "Aegis Containment Breach", "validation_error": e.message})
 
+    # This one can remain a background task since success routing takes time anyway
     asyncio.create_task(log_telemetry(claims, tool_name, tool_arguments, "Mathematical bounds verified", "ALLOWED"))
 
     global http_client
@@ -372,5 +381,5 @@ async def intercept_tool_call(request: Request):
         response = await http_client.post(f"{TARGET_MCP_URL}/mcp/v1/tools/call", json=body, headers=headers_to_forward)
         return Response(content=response.content, status_code=response.status_code, headers=dict(response.headers))
     except httpx.RequestError as e:
-        asyncio.create_task(log_telemetry(claims, tool_name, "Target API", f"Infrastructure Error: {str(e)}", "ERROR"))
+        await log_telemetry(claims, tool_name, "Target API", f"Infrastructure Error: {str(e)}", "ERROR")
         return JSONResponse(status_code=502, content={"error": "Infrastructure Error", "message": str(e)})
